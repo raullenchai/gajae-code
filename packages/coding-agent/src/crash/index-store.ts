@@ -85,6 +85,13 @@ export interface CrashSignatureEntry {
 	commentedIssues?: string[];
 }
 
+export interface CrashLogIdentity {
+	size: number;
+	mtime: number;
+	/** inode on POSIX systems, or undefined on Windows/other. */
+	inode?: number;
+}
+
 export interface CrashIndex {
 	version: number;
 	updatedAt: number;
@@ -98,6 +105,8 @@ export interface CrashIndex {
 	recoveredRecordIds: string[];
 	/** Reported or acknowledged signatures evicted from the index; never recovered from the log. */
 	retiredFingerprints: string[];
+	/** Identity of the crash log at the last compaction; used to skip re-reading unchanged log. */
+	crashLogIdentity?: CrashLogIdentity;
 	signatures: Record<string, CrashSignatureEntry>;
 }
 
@@ -167,6 +176,7 @@ const INDEX_KEYS = new Set([
 	"recentJournalDigests",
 	"recoveredRecordIds",
 	"retiredFingerprints",
+	"crashLogIdentity",
 	"signatures",
 ]);
 
@@ -363,6 +373,18 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		)
 			return undefined;
 	}
+	let crashLogIdentity: CrashLogIdentity | undefined;
+	if (body.crashLogIdentity !== undefined) {
+		if (typeof body.crashLogIdentity !== "object" || Array.isArray(body.crashLogIdentity)) return undefined;
+		const identity = body.crashLogIdentity as Record<string, unknown>;
+		if (!isCount(identity.size) || !isCount(identity.mtime)) return undefined;
+		if (identity.inode !== undefined && !isCount(identity.inode)) return undefined;
+		crashLogIdentity = {
+			size: identity.size as number,
+			mtime: identity.mtime as number,
+			...(typeof identity.inode === "number" ? { inode: identity.inode } : {}),
+		};
+	}
 	if (!body.signatures || typeof body.signatures !== "object" || Array.isArray(body.signatures)) return undefined;
 
 	const signatures = Object.create(null) as Record<string, CrashSignatureEntry>;
@@ -384,6 +406,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		recentJournalDigests: [...((body.recentJournalDigests as string[] | undefined) ?? [])],
 		recoveredRecordIds: [...((body.recoveredRecordIds as string[] | undefined) ?? [])],
 		retiredFingerprints: [...((body.retiredFingerprints as string[] | undefined) ?? [])],
+		...(crashLogIdentity ? { crashLogIdentity } : {}),
 		signatures,
 	};
 }
@@ -463,6 +486,36 @@ async function crashLogExists(crashLogPath: string): Promise<boolean | undefined
 	} finally {
 		await handle?.close().catch(() => {});
 	}
+}
+
+/** Get the identity (size, mtime, inode) of a crash log file for change detection. */
+async function getCrashLogIdentity(crashLogPath: string): Promise<CrashLogIdentity | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(crashLogPath, fs.constants.O_RDONLY | NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile()) return undefined;
+		return {
+			size: stat.size,
+			mtime: stat.mtimeMs ?? 0,
+			...(typeof stat.ino === "number" && stat.ino > 0 ? { inode: stat.ino } : {}),
+		};
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
+
+/** Check if two crash log identities match. Identities match if size and mtime are the same, and inode matches when available. */
+function identitiesMatch(a: CrashLogIdentity, b: CrashLogIdentity): boolean {
+	if (a.size !== b.size || a.mtime !== b.mtime) return false;
+	// If both have an inode, they must match; if only one has it, we can't trust the match
+	// (could be a file re-creation on systems where inode changed)
+	if (a.inode !== undefined && b.inode !== undefined) return a.inode === b.inode;
+	// Without inode info, trust size + mtime match (this is the fallback for Windows)
+	return a.inode === undefined && b.inode === undefined;
 }
 
 async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
@@ -683,8 +736,23 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * journal append failed, or that spent the per-process latch, still writes its
  * record — and without this the compactor would write an index its own reader
  * quarantines whole on the next read.
+ *
+ * When `skipIfIdentityMatches` is provided and matches the current crash log identity,
+ * skip re-reading the log and preserve retained counts as-is.
  */
-async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath: string, now: number): Promise<void> {
+async function recoverAndRecomputeRetainedCounts(
+	index: CrashIndex,
+	crashLogPath: string,
+	now: number,
+	skipIfIdentityMatches?: CrashLogIdentity,
+): Promise<void> {
+	// Check if the crash log hasn't changed; if so, skip re-reading.
+	if (skipIfIdentityMatches) {
+		const currentIdentity = await getCrashLogIdentity(crashLogPath);
+		if (currentIdentity && identitiesMatch(skipIfIdentityMatches, currentIdentity)) {
+			return;
+		}
+	}
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) return;
@@ -796,6 +864,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		await pruneRetiredFingerprints(index, paths.crashLog);
 
 		const drained = await drainJournal(paths);
+		let hasNewJournalEvents = false;
 		for (const file of drained) {
 			const contents = await readNoFollow(file, CRASH_JOURNAL_SCAN_MAX_BYTES);
 			if (contents === undefined) continue;
@@ -812,6 +881,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 				}
 				continue;
 			}
+			hasNewJournalEvents = true;
 			for (const line of contents.split("\n")) {
 				const event = parseCrashEventLine(line);
 				if (event) applyCrashEvent(index, event, now);
@@ -821,8 +891,12 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 				index.recentJournalDigests.splice(0, index.recentJournalDigests.length - RECENT_JOURNAL_DIGEST_LIMIT);
 		}
 
-		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
+		// Skip re-reading the crash log if it hasn't changed and there are no new journal events
+		const skipLogReread = !hasNewJournalEvents ? index.crashLogIdentity : undefined;
+		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now, skipLogReread);
 		index.updatedAt = now;
+		// Store the crash log identity for the next compaction
+		index.crashLogIdentity = await getCrashLogIdentity(paths.crashLog);
 		const serializeIndex = (): string =>
 			`${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [] })}\n`;
 		let serialized = serializeIndex();

@@ -655,6 +655,57 @@ describe("compactCrashIndex", () => {
 		expect(index.signatures[fingerprintFor(6)]?.lifetimeCount).toBe(2);
 		expect((await readCrashIndex(paths)).signatures[fingerprintFor(6)]?.lifetimeCount).toBe(2);
 	});
+
+	it("skips re-reading an unchanged crash log on subsequent compactions", async () => {
+		const paths = await tempPaths();
+		// Create an initial crash log with some recoverable records
+		const recovered = recoverableRecord(500, "initial crash");
+		await fs.writeFile(paths.crashLog, recovered.text);
+		appendCrashEvent(occurrence(recovered.fingerprint, recovered.recordId, NOW), paths.events);
+
+		// First compaction should read the log and store crashLogIdentity
+		const first = await compactCrashIndex({ paths, now: NOW });
+		expect(first.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		expect(first.signatures[recovered.fingerprint]?.retainedCount).toBe(1);
+		expect(first.crashLogIdentity).toBeDefined();
+		const firstIdentity = first.crashLogIdentity;
+
+		// Second compaction with no journal events and unchanged log should skip re-reading
+		const second = await compactCrashIndex({ paths, now: NOW + 1000 });
+		expect(second.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		expect(second.signatures[recovered.fingerprint]?.retainedCount).toBe(1);
+		expect(second.crashLogIdentity).toEqual(firstIdentity);
+
+		// Append another record to the crash log
+		const another = recoverableRecord(501, "second crash");
+		await fs.appendFile(paths.crashLog, another.text);
+
+		// Third compaction should detect the log changed and re-read
+		const third = await compactCrashIndex({ paths, now: NOW + 2000 });
+		expect(third.signatures[recovered.fingerprint]?.retainedCount).toBe(1);
+		expect(third.signatures[another.fingerprint]?.retainedCount).toBe(1);
+		expect(third.crashLogIdentity?.size).toBeGreaterThan(firstIdentity?.size ?? 0);
+	});
+
+	it("re-reads the crash log when journal events are new", async () => {
+		const paths = await tempPaths();
+		const recovered = recoverableRecord(502, "test crash");
+		await fs.writeFile(paths.crashLog, recovered.text);
+		appendCrashEvent(occurrence(recovered.fingerprint, recovered.recordId, NOW), paths.events);
+
+		// First compaction
+		const first = await compactCrashIndex({ paths, now: NOW });
+		expect(first.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		const firstDigests = first.recentJournalDigests.length;
+
+		// Add a new journal event
+		appendCrashEvent(occurrence(recovered.fingerprint, recordId(10000), NOW + 1000), paths.events);
+
+		// Second compaction should re-read the log
+		const second = await compactCrashIndex({ paths, now: NOW + 1000 });
+		expect(second.signatures[recovered.fingerprint]?.lifetimeCount).toBe(2);
+		expect(second.recentJournalDigests.length).toBeGreaterThan(firstDigests);
+	});
 });
 
 describe("parseCrashIndex", () => {
