@@ -107,6 +107,10 @@ export interface CrashIndex {
 	retiredFingerprints: string[];
 	/** Identity of the crash log at the last compaction; used to skip re-reading unchanged log. */
 	crashLogIdentity?: CrashLogIdentity;
+	/** Retained fingerprints from the crash log, cached to speed up pruning. */
+	cachedRetainedFingerprints?: string[];
+	/** Retained record IDs from the crash log, cached to speed up pruning. */
+	cachedRetainedRecordIds?: string[];
 	signatures: Record<string, CrashSignatureEntry>;
 }
 
@@ -497,7 +501,9 @@ async function getCrashLogIdentity(crashLogPath: string): Promise<CrashLogIdenti
 		if (!stat.isFile()) return undefined;
 		return {
 			size: stat.size,
-			mtime: stat.mtimeMs ?? 0,
+			// Truncate mtime to safe integer: stat.mtimeMs is fractional, but isCount() requires safe integers.
+			// Using Math.trunc() ensures the persisted identity always parses without quarantine.
+			mtime: Math.trunc(stat.mtimeMs ?? 0),
 			...(typeof stat.ino === "number" && stat.ino > 0 ? { inode: stat.ino } : {}),
 		};
 	} catch (error) {
@@ -520,14 +526,46 @@ function identitiesMatch(a: CrashLogIdentity, b: CrashLogIdentity): boolean {
 
 async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
 	if (index.retiredFingerprints.length === 0) return;
-	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
-	if (contents === undefined) {
-		if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
-		return;
+	// Try to reuse cached retained fingerprints if the crash log identity matches.
+	let retained: Set<string>;
+	let retainedIds: Set<string>;
+	if (index.crashLogIdentity && index.cachedRetainedFingerprints && index.cachedRetainedRecordIds) {
+		const currentIdentity = await getCrashLogIdentity(crashLogPath);
+		if (currentIdentity && identitiesMatch(index.crashLogIdentity, currentIdentity)) {
+			// Log hasn't changed, reuse cached sets
+			retained = new Set(index.cachedRetainedFingerprints);
+			retainedIds = new Set(index.cachedRetainedRecordIds);
+		} else {
+			// Log has changed, read and cache new sets
+			const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
+			if (contents === undefined) {
+				if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
+				return;
+			}
+			const records = parseRecoverableCrashRecords(contents);
+			retained = new Set(records.map(record => record.fingerprint));
+			retainedIds = new Set(records.map(record => record.recordId));
+			// Update cache
+			index.cachedRetainedFingerprints = [...retained];
+			index.cachedRetainedRecordIds = [...retainedIds];
+		}
+	} else {
+		// No cache available, read and cache
+		const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
+		if (contents === undefined) {
+			if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
+			return;
+		}
+		const records = parseRecoverableCrashRecords(contents);
+		retained = new Set(records.map(record => record.fingerprint));
+		retainedIds = new Set(records.map(record => record.recordId));
+		// Cache for future use
+		if (index.crashLogIdentity) {
+			index.cachedRetainedFingerprints = [...retained];
+			index.cachedRetainedRecordIds = [...retainedIds];
+		}
 	}
-	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => retained.has(fingerprint));
-	const retainedIds = new Set(parseRecoverableCrashRecords(contents).map(record => record.recordId));
 	index.recoveredRecordIds = index.recoveredRecordIds.filter(recordId => retainedIds.has(recordId));
 }
 
@@ -894,11 +932,13 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		// Skip re-reading the crash log if it hasn't changed and there are no new journal events
 		const skipLogReread = !hasNewJournalEvents ? index.crashLogIdentity : undefined;
 		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now, skipLogReread);
+		// Clear the old identity before we update it; a fresh read always computes a new identity.
+		index.crashLogIdentity = undefined;
 		index.updatedAt = now;
 		// Store the crash log identity for the next compaction
 		index.crashLogIdentity = await getCrashLogIdentity(paths.crashLog);
 		const serializeIndex = (): string =>
-			`${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [] })}\n`;
+			`${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [], cachedRetainedFingerprints: undefined, cachedRetainedRecordIds: undefined })}\n`;
 		let serialized = serializeIndex();
 		while (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES && evictOne(index)) {
 			serialized = serializeIndex();
